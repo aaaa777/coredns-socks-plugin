@@ -8,100 +8,66 @@ import (
 	"github.com/coredns/coredns/plugin"
 	"github.com/coredns/coredns/request"
 
-	"github.com/cretz/go-socks5"
+	"github.com/v2fly/v2ray-core/v5/common/net/proxy/socks5"
 	"github.com/miekg/dns"
 )
 
 type SOCKSPlugin struct {
 	Next     plugin.Handler
-	Domains  []string
-	SOCKSConfig *socks5.Config
-}
-
-func (s *SOCKSPlugin) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
-	state := request.Request{W: w, Req: r}
-	qname := state.Name()
-
-	// 対象ドメインかどうかをチェック
-	if s.shouldProxyDomain(qname) {
-		return s.proxyDNSRequest(ctx, w, r)
-	}
-
-	// 通常のDNS解決
-	return plugin.NextOrFailure(s.Name(), s.Next, ctx, w, r)
-}
-
-func (s *SOCKSPlugin) shouldProxyDomain(domain string) bool {
-	for _, d := range s.Domains {
-		if dns.IsSubDomain(d, domain) {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *SOCKSPlugin) proxyDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
-	// SOCKS5プロキシサーバーを作成
-	server, err := socks5.New(s.SOCKSConfig)
-	if err != nil {
-		return dns.RcodeServerFailure, err
-	}
-
-	// DNS over SOCKSプロキシ
-	dialer, err := server.Dial("tcp", "8.8.8.8:53")
-	if err != nil {
-		return dns.RcodeServerFailure, err
-	}
-	defer dialer.Close()
-
-	// DNSクエリを送信
-	dnsConn := &dns.Conn{Conn: dialer}
-	if err := dnsConn.WriteMsg(r); err != nil {
-		return dns.RcodeServerFailure, err
-	}
-
-	// 応答を受信
-	resp, err := dnsConn.ReadMsg()
-	if err != nil {
-		return dns.RcodeServerFailure, err
-	}
-
-	// 応答を返す
-	if err := w.WriteMsg(resp); err != nil {
-		return dns.RcodeServerFailure, err
-	}
-
-	return dns.RcodeSuccess, nil
+	Hostname string
+	Port     string
+	DNSServer string
 }
 
 func (s *SOCKSPlugin) Name() string { return "socks" }
 
-func init() {
-	plugin.Register("socks", setup)
-}
+func (s *SOCKSPlugin) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+	state := request.Request{W: w, Req: r}
 
-func setup(c *dnsserver.Controller) error {
-	// プラグインの設定をパース
-	socks := &SOCKSPlugin{}
-	
-	for c.Next() {
-		// 設定ブロックからドメインとSOCKS設定を読み取る
-		args := c.RemainingArgs()
-		if len(args) < 2 {
-			return c.ArgErr()
-		}
-
-		socks.Domains = args[1:]
-		socks.SOCKSConfig = &socks5.Config{
-			ProxyAddr: args[0],
-			// 必要に応じて認証情報を追加
-		}
+	// SOCKSプロキシの設定
+	dialFunc := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return socks5.Dial(context.Background(), &socks5.DialerConfig{
+			Address: &net.TCPAddr{
+				IP:   net.ParseIP(s.Hostname),
+				Port: portToInt(s.Port),
+			},
+		})
 	}
 
-	c.AddPlugin(func(next plugin.Handler) plugin.Handler {
-		socks.Next = next
-		return socks
-	})
+	// DNS転送
+	c := &dns.Client{
+		Dialer: dialFunc,
+	}
 
-	return nil
+	// 指定されたDNSサーバーに転送
+	resp, _, err := c.Exchange(r, net.JoinHostPort(s.DNSServer, "53"))
+	if err != nil {
+		return plugin.NextOrFailure(s.Name(), s.Next, ctx, w, r)
+	}
+
+	// レスポンスを書き戻す
+	w.WriteMsg(resp)
+	return dns.RcodeSuccess, nil
+}
+
+// ポート文字列を整数に変換するヘルパー関数
+func portToInt(port string) int {
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		return 0
+	}
+	return p
+}
+
+// プラグインのセットアップ関数
+func Setup(next plugin.Handler) func(c *dnsserver.Config) error {
+	return func(c *dnsserver.Config) error {
+		c.AddPlugin(func(next plugin.Handler) plugin.Handler {
+			return &SOCKSPlugin{
+				Next: next,
+				// デフォルト値や設定からの読み込みを追加
+			}
+		})
+		return nil
+	}
 }
